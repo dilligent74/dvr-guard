@@ -1,0 +1,8 @@
+flask
+opencv-python
+numpy
+onnxruntime
+bcrypt
+pyyaml
+requests
+python-telegram-bot

@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+
+{% block title %}Snapshots – DVR Guard{% endblock %}
+
+{% block content %}
+<div class="snapshot-filters">
+  <div class="filter-row">
+    <a href="{{ url_for('snapshots', tier='confirmed_45plus', camera=camera, date=date, page=1) }}"
+       class="tier-pill {% if tier == 'confirmed_45plus' %}active{% endif %}">Confirmed</a>
+    <a href="{{ url_for('snapshots', tier='uncertain_35to45', camera=camera, date=date, page=1) }}"
+       class="tier-pill {% if tier == 'uncertain_35to45' %}active{% endif %}">Uncertain</a>
+    <a href="{{ url_for('snapshots', tier='weak_25to35', camera=camera, date=date, page=1) }}"
+       class="tier-pill {% if tier == 'weak_25to35' %}active{% endif %}">Weak</a>
+    <a href="{{ url_for('snapshots', tier='motion_no_detection', camera=camera, date=date, page=1) }}"
+       class="tier-pill {% if tier == 'motion_no_detection' %}active{% endif %}">Motion-miss</a>
+  </div>
+  <label for="camera">Camera</label>
+  <select id="camera" onchange="var c=this.value; location='{{ url_for('snapshots', tier=tier, date=date, page=1) }}' + (c ? '&camera=' + encodeURIComponent(c) : '');">
+    <option value="" {% if not camera %}selected{% endif %}>All cameras</option>
+    {% for cam in cameras %}
+    <option value="{{ cam }}" {% if cam == camera %}selected{% endif %}>{{ cam }}</option>
+    {% endfor %}
+  </select>
+  <label for="date">Date</label>
+  <input type="date" id="date"
+         value="{{ date }}"
+         onchange="location='{{ url_for('snapshots', tier=tier, camera=camera, page=1) }}' + '&date=' + this.value;">
+</div>
+
+{% if snapshots %}
+<div class="snapshot-grid">
+  {% for snap in snapshots %}
+  <div class="snapshot-item">
+    <img class="snapshot-thumb"
+         src="{{ url_for('snapshot_thumb', tier=tier, filename=snap.filename) }}"
+         alt="Snapshot"
+         loading="lazy"
+         onclick="openLightbox('{{ url_for('snapshot_full', tier=tier, filename=snap.filename) }}')">
+    <div class="snapshot-meta">
+      {% if tier == "motion_no_detection" %}
+      <span class="tier-badge tier-motion">motion-miss</span>
+      {% elif tier == "confirmed_45plus" %}
+      <span class="tier-badge tier-confirmed">confirmed</span>
+      {% elif tier == "uncertain_35to45" %}
+      <span class="tier-badge tier-uncertain">uncertain</span>
+      {% else %}
+      <span class="tier-badge tier-weak">weak</span>
+      {% endif %}
+      {% if snap.confidence is not none %}
+      <span class="conf-badge">{{ "%0.2f"|format(snap.confidence) }}</span>
+      {% endif %}
+      <span class="time-badge">{{ snap.time_str }}</span>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<div class="pagination">
+  {% if page > 1 %}
+  <a class="btn" href="{{ url_for('snapshots', tier=tier, camera=camera, date=date, page=page-1) }}">← Previous</a>
+  {% else %}
+  <span class="btn" style="visibility:hidden;" aria-hidden="true"></span>
+  {% endif %}
+  {% if has_next %}
+  <a class="btn" href="{{ url_for('snapshots', tier=tier, camera=camera, date=date, page=page+1) }}">Next →</a>
+  {% else %}
+  <span class="btn" style="visibility:hidden;" aria-hidden="true"></span>
+  {% endif %}
+</div>
+{% else %}
+<div class="empty-state">No snapshots found for this filter.</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+
+{% block title %}Alerts – DVR Guard{% endblock %}
+
+{% block content %}
+{% if alerts %}
+<div class="alert-list">
+  {% for alert in alerts %}
+  <div class="alert-item">
+    <img class="alert-thumb"
+         src="{{ url_for('snapshot_thumb', tier='confirmed_45plus', filename=alert.filename) }}"
+         alt="Snapshot"
+         loading="lazy"
+         onclick="openLightbox('{{ url_for('snapshot_full', tier='confirmed_45plus', filename=alert.filename) }}')">
+    <div class="alert-info">
+      <div class="alert-camera">{{ alert.camera_name }}</div>
+      <div class="alert-time">{{ alert.timestamp_str }}</div>
+      {% if alert.confidence is not none %}
+      <span class="alert-confidence">{{ "%0.2f"|format(alert.confidence) }}</span>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">No recent alerts.</div>
+{% endif %}
+{% endblock %}

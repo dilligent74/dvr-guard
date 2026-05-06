@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+
+{% block title %}Settings – DVR Guard{% endblock %}
+
+{% block content %}
+<div class="settings-grid">
+  {% if config.cameras is defined %}
+  <div class="settings-card">
+    <h3>Cameras</h3>
+    {% for cam in config.cameras %}
+    <div class="setting-item">
+      <div class="setting-label">Channel {{ cam.id }} — {{ cam.name }}</div>
+      <div class="setting-value">
+        RTSP: {{ cam.rtsp }}<br>
+        Confidence threshold: {{ cam.confidence_threshold }}<br>
+        Cooldown: {{ cam.cooldown_seconds }}s<br>
+        Motion enabled: {{ cam.motion.enabled }}<br>
+        Min contour area: {{ cam.motion.min_contour_area }}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% if config.detection is defined %}
+  <div class="settings-card">
+    <h3>Model</h3>
+    <div class="setting-item">
+      <div class="setting-label">Confidence threshold</div>
+      <div class="setting-value">{{ config.detection.confidence_threshold }}</div>
+    </div>
+    <div class="setting-item">
+      <div class="setting-label">NMS IoU threshold</div>
+      <div class="setting-value">{{ config.detection.nms_iou_threshold }}</div>
+    </div>
+    <div class="setting-item">
+      <div class="setting-label">Input size</div>
+      <div class="setting-value">{{ config.detection.input_size }}</div>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if config.dashboard is defined %}
+  <div class="settings-card">
+    <h3>Dashboard</h3>
+    <div class="setting-item">
+      <div class="setting-label">Recent alerts count</div>
+      <div class="setting-value">{{ config.dashboard.recent_alerts_count }}</div>
+    </div>
+    <div class="setting-item">
+      <div class="setting-label">Snapshots directory</div>
+      <div class="setting-value">{{ config.dashboard.snapshots_dir }}</div>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if config.debug is defined %}
+  <div class="settings-card">
+    <h3>Debug</h3>
+    <div class="setting-item">
+      <div class="setting-label">Tiered snapshots</div>
+      <div class="setting-value">{{ "Enabled" if config.debug.tiered_snapshots else "Disabled" }}</div>
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

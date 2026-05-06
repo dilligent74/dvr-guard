@@ -1,0 +1,48 @@
+{% if stats.per_camera %}
+<table class="stats-table">
+  <thead>
+    <tr>
+      <th>Camera</th>
+      <th>Confirmed</th>
+      <th>Detected-only</th>
+      <th>Missed</th>
+      <th>Miss rate</th>
+      <th>Verdict</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for cam in stats.per_camera %}
+    <tr>
+      <td>{{ cam.name }}</td>
+      <td>{{ cam.confirmed }}</td>
+      <td>{{ cam.detected_only }}</td>
+      <td>{{ cam.missed }}</td>
+      <td>{{ "%0.1f%%"|format(cam.miss_rate * 100) }}</td>
+      <td>
+        <span class="verdict-pill verdict-{{ cam.verdict }}">{{ cam.verdict_text }}</span>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<div class="global-stats">
+  <h3>Global stats</h3>
+  <div class="stat-row">
+    <span>Dropout rate</span>
+    <span>{{ "%0.1f%%"|format(stats.global_stats.dropout_rate * 100) }}</span>
+  </div>
+  <div class="stat-explanation">{{ stats.global_stats.dropout_explanation }}</div>
+  <div class="stat-row">
+    <span>Detected-but-not-alerted events</span>
+    <span>{{ stats.global_stats.detected_not_alerted }}</span>
+  </div>
+  <div class="stat-row">
+    <span>Avg peak confidence</span>
+    <span>{{ "%0.2f"|format(stats.global_stats.avg_peak_confidence) }}</span>
+  </div>
+  <div class="stat-recommendation">{{ stats.global_stats.recommendation }}</div>
+</div>
+{% else %}
+<div class="empty-state">Not enough data for analysis.</div>
+{% endif %}

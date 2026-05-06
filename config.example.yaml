@@ -1,0 +1,46 @@
+# Example configuration for DVR Guard
+# Copy to config.yaml and fill in your values
+
+cameras:
+  - id: 0
+    name: "Camera 1"
+    rtsp: "rtsp://user:pass@192.168.1.100:554/Streaming/Channels/102"
+    confidence_threshold: 0.45
+    cooldown_seconds: 30
+    motion:
+      min_contour_area: 800
+      enabled: true
+
+detection:
+  model_path: "models/yolo26n.onnx"
+  confidence_threshold: 0.45
+  nms_iou_threshold: 0.45  # INERT - model exported with nms=True
+  person_class_id: 0
+  input_size: 640
+
+motion:
+  enabled: true
+  blur_size: 21
+  pixel_threshold: 25
+  min_contour_area: 800
+
+cooldown_seconds: 60
+snapshot_dir: "snapshots"
+
+telegram:
+  token: "your_telegram_bot_token"
+  chat_id: "your_chat_id"
+
+debug:
+  tiered_snapshots: true
+
+max_snapshots_per_folder: 1000
+
+dashboard:
+  port: 8080
+  public_access: true
+  viewer_password: ""           # leave empty to set on first login
+  admin_password: ""            # leave empty to set on first login
+  recent_alerts_count: 10
+  snapshots_dir: "snapshots"
+  secret_key: null              # generated automatically on first run

@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+
+{% block title %}Stats – DVR Guard{% endblock %}
+
+{% block content %}
+<div class="system-health-card">
+  <h3>System Health</h3>
+  <div class="health-row">
+    <span>Uptime</span>
+    <span>{{ uptime }}</span>
+  </div>
+  <div class="health-row">
+    <span>Inference thread</span>
+    <span {% if inference_status != 'RUNNING' %}class="health-warn"{% endif %}>
+      {{ inference_status }} (last inference {{ inference_age }})
+    </span>
+  </div>
+  <div class="health-row">
+    <span>Inference queue</span>
+    <span {% if inference_queue > 4 %}class="health-warn"{% endif %}>
+      {{ inference_queue }} / 8
+    </span>
+  </div>
+  <div class="health-row">
+    <span>Notifier queue</span>
+    <span {% if notifier_queue > 2 %}class="health-warn"{% endif %}>
+      {{ notifier_queue }} / 4
+    </span>
+  </div>
+</div>
+
+<div class="system-health-card">
+  <h3>Camera streams</h3>
+  {% for cam in cameras %}
+  <div class="health-row">
+    <span>{{ cam.name }}</span>
+    <span style="font-weight:600; margin-right:12px; {% if not cam.live %}color:var(--danger);{% endif %}">
+      {% if cam.live %}LIVE{% else %}OFFLINE{% endif %}
+    </span>
+    <span class="health-age">{{ cam.age_str }}</span>
+  </div>
+  {% else %}
+  <div class="empty-state">No cameras configured.</div>
+  {% endfor %}
+</div>
+
+<div class="stats-controls">
+  <label>Gap threshold (s)
+    <input type="number" id="gap" step="0.1" value="3.0" min="0.5" max="30">
+  </label>
+  <button id="btn-compute" class="btn btn-primary" onclick="computeStats()">Compute stats</button>
+  <button id="btn-refresh" class="btn hidden" onclick="computeStats(true)">Force refresh</button>
+</div>
+
+<div id="status" class="stats-status">Tap "Compute stats" to run analysis.</div>
+
+<div id="result" class="hidden">
+  <div id="cache-age" class="cache-age"></div>
+</div>
+
+<div id="spinner" class="empty-state hidden">Computing…</div>
+
+<template id="result-table">
+  <div class="stats-table-wrapper"></div>
+</template>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function(){
+  'use strict';
+  const statusEl = document.getElementById('status');
+  const resultEl = document.getElementById('result');
+  const spinnerEl = document.getElementById('spinner');
+  const refreshEl = document.getElementById('btn-refresh');
+  const computeEl = document.getElementById('btn-compute');
+  const ageEl = document.getElementById('cache-age');
+
+  let pollTimer = null;
+
+  function setSpinner(on) {
+    if (on) { spinnerEl.classList.remove('hidden'); }
+    else { spinnerEl.classList.add('hidden'); }
+  }
+
+  function poll() {
+    const gap = document.getElementById('gap').value;
+    fetch('{{ url_for('stats_results') }}?gap_threshold=' + encodeURIComponent(gap))
+      .then(r => r.json())
+      .then(data => {
+        if (data.status === 'computing') {
+          statusEl.textContent = 'Computing…';
+          setSpinner(true);
+          return;
+        }
+        setSpinner(false);
+        clearInterval(pollTimer); pollTimer = null;
+        computeEl.disabled = false;
+        statusEl.classList.add('hidden');
+        resultEl.classList.remove('hidden');
+        refreshEl.classList.remove('hidden');
+        resultEl.innerHTML = data.html;
+        if (data.age) {
+          resultEl.insertAdjacentHTML('afterbegin', '<p class="cache-age">Computed ' + data.age + ' ago</p>');
+        }
+      })
+      .catch(() => {
+        setSpinner(false);
+        clearInterval(pollTimer); pollTimer = null;
+        statusEl.textContent = 'Error loading results. Retry?';
+        statusEl.classList.remove('hidden');
+        computeEl.disabled = false;
+      });
+  }
+
+  window.computeStats = function(force) {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    const gap = document.getElementById('gap').value;
+    const url = '{{ url_for('stats_results') }}?gap_threshold=' + encodeURIComponent(gap)
+                + (force ? '&force=true' : '');
+    computeEl.disabled = true;
+    setSpinner(true);
+    statusEl.textContent = 'Starting…';
+    statusEl.classList.remove('hidden');
+    resultEl.classList.add('hidden');
+    refreshEl.classList.add('hidden');
+    fetch(url).then(() => {
+      poll();
+      pollTimer = setInterval(poll, 1000);
+    }).catch(() => {
+      setSpinner(false);
+      statusEl.textContent = 'Failed to start computation.';
+      computeEl.disabled = false;
+    });
+  };
+})();
+</script>
+{% endblock %}

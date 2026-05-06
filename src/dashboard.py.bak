@@ -1,0 +1,995 @@
+#!/usr/bin/env python3
+"""
+DVR Guard Dashboard — Mobile-first Flask interface.
+
+Restarting after a password change invalidates all active sessions
+for that role. Family members will need to log in again.
+"""
+
+import os
+import sys
+import cv2
+import time
+import yaml
+import bcrypt
+import threading
+from datetime import datetime, timedelta
+from functools import wraps
+from collections import defaultdict
+
+from flask import (
+    Flask, render_template, request, redirect, url_for,
+    session, send_file, jsonify, make_response, flash,
+)
+
+# ---------------------------------------------------------------------------
+# Helpers for system health
+# ---------------------------------------------------------------------------
+
+def _fmt_age(dt):
+    """Format a datetime as a precise relative age string (e.g. '2s ago', '3m ago')."""
+    if dt is None:
+        return "never"
+    secs = int((datetime.now() - dt).total_seconds())
+    if secs < 1:
+        return "just now"
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        h = secs // 3600
+        m = (secs % 3600) // 60
+        return f"{h}h {m}m ago" if m else f"{h}h ago"
+    d = secs // 86400
+    h = (secs % 86400) // 3600
+    return f"{d}d {h}h ago" if h else f"{d}d ago"
+
+
+def _fmt_uptime(dt):
+    """Format pipeline start time as '3d 14h 22m'."""
+    if dt is None:
+        return "unknown"
+    total = int((datetime.now() - dt).total_seconds())
+    d = total // 86400
+    h = (total % 86400) // 3600
+    m = (total % 3600) // 60
+    parts = []
+    if d:
+        parts.append(f"{d}d")
+    if h:
+        parts.append(f"{h}h")
+    if m:
+        parts.append(f"{m}m")
+    return " ".join(parts) if parts else "<1m"
+
+
+def _resolve_snapshot_urls(snapshot_path):
+    """Convert a filesystem snapshot path to thumbnail/full URLs."""
+    if not snapshot_path:
+        return None, None
+    p = snapshot_path.replace("\\", "/")
+    parts = p.split("/")
+    if len(parts) < 2:
+        return None, None
+    tier = parts[-2]
+    filename = parts[-1]
+    valid = {"confirmed_45plus", "uncertain_35to45", "weak_25to35", "motion_no_detection"}
+    if tier not in valid or not filename.endswith(".jpg"):
+        return None, None
+    try:
+        return (
+            url_for("snapshot_thumb", tier=tier, filename=filename),
+            url_for("snapshot_full", tier=tier, filename=filename),
+        )
+    except Exception:
+        return None, None
+
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "config.yaml")
+
+
+# ---------------------------------------------------------------------------
+# Snapshot filename parsing (matches analyse_snapshots.py)
+# ---------------------------------------------------------------------------
+
+def _parse_snapshot_filename(filename, tier=None):
+    """Parse a snapshot filename. Returns dict or None.
+    
+    Expected format: YYYYMMDD-HH_MM_SS-{camera}-c{NNN}.jpg
+    Example: 20250506-14_30_25-Față-ST-c087.jpg
+    """
+    if not filename.endswith(".jpg"):
+        return None
+    name = filename[:-4]
+
+    # Modern format: YYYYMMDD-HH_MM_SS-{camera}-c{NNN}.jpg
+    if len(name) >= 8 and name[:8].isdigit():
+        parts = name.split("-")
+        if len(parts) >= 3:
+            date_str = parts[0]
+            time_str = parts[1]
+            if len(date_str) == 8 and date_str.isdigit():
+                if len(time_str) == 8 and time_str[2] == "_" and time_str[5] == "_":
+                    hh = time_str[0:2]
+                    mm = time_str[3:5]
+                    ss = time_str[6:8]
+                    if hh.isdigit() and mm.isdigit() and ss.isdigit():
+                        remaining = parts[2:]
+                        conf = None
+                        if remaining and remaining[-1].startswith("c"):
+                            conf_str = remaining[-1][1:]
+                            if conf_str.isdigit():
+                                conf = int(conf_str) / 100.0
+                                camera_name = "-".join(remaining[:-1])
+                            else:
+                                camera_name = "-".join(remaining)
+                        else:
+                            camera_name = "-".join(remaining)
+                        try:
+                            timestamp = datetime(
+                                int(date_str[:4]),
+                                int(date_str[4:6]),
+                                int(date_str[6:8]),
+                                int(hh),
+                                int(mm),
+                                int(ss),
+                            )
+                        except ValueError:
+                            return None
+                        return {
+                            "camera_name": camera_name,
+                            "timestamp": timestamp,
+                            "confidence": conf,
+                            "filename": filename,
+                            "tier": tier,
+                        }
+    
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Folder listing cache
+# ---------------------------------------------------------------------------
+_folder_cache = {}
+_FOLDER_CACHE_TTL = 30.0
+
+
+def _get_folder_files(snapshots_dir, tier):
+    """Return cached, sorted file list for a tier."""
+    now = time.monotonic()
+    key = (snapshots_dir, tier)
+    if key in _folder_cache:
+        ts, files = _folder_cache[key]
+        if now - ts < _FOLDER_CACHE_TTL:
+            return files
+    tier_dir = os.path.join(snapshots_dir, tier)
+    if not os.path.isdir(tier_dir):
+        files = []
+    else:
+        files = sorted(os.listdir(tier_dir), reverse=True)
+    _folder_cache[key] = (now, files)
+    return files
+
+
+def _walk_all_snapshots(snapshots_dir):
+    """Walk all tier folders and return parsed records."""
+    tiers = ["confirmed_45plus", "uncertain_35to45", "weak_25to35", "motion_no_detection"]
+    records = []
+    for tier in tiers:
+        for filename in _get_folder_files(snapshots_dir, tier):
+            if not filename.endswith(".jpg"):
+                continue
+            rec = _parse_snapshot_filename(filename, tier)
+            if rec:
+                records.append(rec)
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Stats computation (adapted from analyse_snapshots.py)
+# ---------------------------------------------------------------------------
+
+def _cluster_sequences(records, gap_threshold):
+    by_camera = defaultdict(list)
+    for record in records:
+        by_camera[record["camera_name"]].append(record)
+    for camera_name in by_camera:
+        by_camera[camera_name].sort(key=lambda r: r["timestamp"])
+    sequences_by_camera = {}
+    for camera_name, cam_records in by_camera.items():
+        sequences = []
+        current_seq = []
+        for record in cam_records:
+            if not current_seq:
+                current_seq.append(record)
+            else:
+                gap = (record["timestamp"] - current_seq[-1]["timestamp"]).total_seconds()
+                if gap > gap_threshold:
+                    sequences.append(current_seq)
+                    current_seq = [record]
+                else:
+                    current_seq.append(record)
+        if current_seq:
+            sequences.append(current_seq)
+        sequences_by_camera[camera_name] = sequences
+    return sequences_by_camera
+
+
+def _classify_sequences(sequences_by_camera):
+    confirmed_tiers = {"confirmed_45plus"}
+    subthreshold_tiers = {"uncertain_35to45", "weak_25to35"}
+    enriched = {}
+    for camera_name, sequences in sequences_by_camera.items():
+        enriched[camera_name] = []
+        for seq in sequences:
+            tiers_in_seq = {r["tier"] for r in seq}
+            has_confirmed = bool(tiers_in_seq & confirmed_tiers)
+            has_subthreshold = bool(tiers_in_seq & subthreshold_tiers)
+            if has_confirmed:
+                seq_type = "confirmed_sequence"
+            elif has_subthreshold:
+                seq_type = "subthreshold_only"
+            else:
+                seq_type = "miss_sequence"
+            classified_frames = []
+            for record in seq:
+                tier = record["tier"]
+                if seq_type == "confirmed_sequence" and tier != "confirmed_45plus":
+                    frame_type = "dropout"
+                elif seq_type == "miss_sequence" and tier == "motion_no_detection":
+                    frame_type = "genuine_miss"
+                elif seq_type == "subthreshold_only" and tier in subthreshold_tiers:
+                    frame_type = "subthreshold_detection"
+                else:
+                    frame_type = "other"
+                classified_frames.append({**record, "frame_type": frame_type})
+            enriched[camera_name].append(
+                {
+                    "type": seq_type,
+                    "frames": classified_frames,
+                    "start_time": seq[0]["timestamp"],
+                    "end_time": seq[-1]["timestamp"],
+                    "duration": (seq[-1]["timestamp"] - seq[0]["timestamp"]).total_seconds(),
+                }
+            )
+    return enriched
+
+
+def _compute_stats(enriched_sequences):
+    stats = {
+        "total_frames": 0,
+        "total_sequences": 0,
+        "tier_counts": defaultdict(int),
+        "tier_confidences": defaultdict(list),
+        "seq_type_counts": defaultdict(int),
+        "seq_type_cameras": defaultdict(set),
+        "dropout_counts": defaultdict(int),
+        "total_dropout_frames": 0,
+        "genuine_miss_sequences": 0,
+        "genuine_miss_frames": 0,
+        "genuine_miss_by_camera": defaultdict(int),
+        "subthreshold_sequences": 0,
+        "subthreshold_frames": 0,
+        "subthreshold_peak_confs": [],
+        "camera_summary": defaultdict(lambda: defaultdict(int)),
+    }
+    for camera_name, sequences in enriched_sequences.items():
+        for seq in sequences:
+            stats["total_sequences"] += 1
+            stats["seq_type_counts"][seq["type"]] += 1
+            stats["seq_type_cameras"][seq["type"]].add(camera_name)
+            if seq["type"] == "miss_sequence":
+                stats["genuine_miss_sequences"] += 1
+                stats["genuine_miss_frames"] += len(seq["frames"])
+                stats["genuine_miss_by_camera"][camera_name] += 1
+            elif seq["type"] == "subthreshold_only":
+                stats["subthreshold_sequences"] += 1
+                stats["subthreshold_frames"] += len(seq["frames"])
+                confs = [f["confidence"] for f in seq["frames"] if f["confidence"] is not None]
+                if confs:
+                    stats["subthreshold_peak_confs"].append(max(confs))
+            for frame in seq["frames"]:
+                stats["total_frames"] += 1
+                stats["tier_counts"][frame["tier"]] += 1
+                if frame["confidence"] is not None:
+                    stats["tier_confidences"][frame["tier"]].append(frame["confidence"])
+                frame_type = frame["frame_type"]
+                if frame_type == "dropout":
+                    stats["total_dropout_frames"] += 1
+                    if frame["tier"] == "uncertain_35to45":
+                        stats["dropout_counts"]["uncertain"] += 1
+                    elif frame["tier"] == "weak_25to35":
+                        stats["dropout_counts"]["weak"] += 1
+                    elif frame["tier"] == "motion_no_detection":
+                        stats["dropout_counts"]["motion"] += 1
+            seq_key = {
+                "confirmed_sequence": "confirmed",
+                "miss_sequence": "miss",
+                "subthreshold_only": "subthreshold",
+            }.get(seq["type"])
+            if seq_key:
+                stats["camera_summary"][camera_name][seq_key] += 1
+            stats["camera_summary"][camera_name]["total"] += 1
+
+    stats["tier_conf_stats"] = {}
+    for tier in ["confirmed_45plus", "uncertain_35to45", "weak_25to35"]:
+        confs = stats["tier_confidences"].get(tier, [])
+        if confs:
+            stats["tier_conf_stats"][tier] = {
+                "min": min(confs),
+                "max": max(confs),
+                "avg": sum(confs) / len(confs),
+                "count": len(confs),
+            }
+        else:
+            stats["tier_conf_stats"][tier] = None
+    return stats
+
+
+def _pct(part, total):
+    return (part / total * 100) if total > 0 else 0.0
+
+
+def _format_stats_for_template(raw_stats, gap_threshold):
+    per_camera = []
+    any_warned = False
+    for cam_name in sorted(raw_stats["camera_summary"]):
+        s = raw_stats["camera_summary"][cam_name]
+        cam_miss = s.get("miss", 0)
+        cam_confirmed = s.get("confirmed", 0)
+        cam_total = s.get("total", 0)
+        cam_miss_rate = _pct(cam_miss, cam_total) / 100.0
+
+        if cam_confirmed == 0:
+            verdict = "skip"
+            verdict_text = "skip — no confirmed detections"
+        elif cam_miss > 0 and cam_confirmed > 0 and (cam_miss / cam_confirmed) > 10:
+            verdict = "traffic"
+            verdict_text = "traffic — busy scene"
+        elif cam_miss_rate > 0.10 and cam_miss >= 5:
+            verdict = "warn"
+            verdict_text = "[WARN] high miss rate"
+            any_warned = True
+        else:
+            verdict = "ok"
+            verdict_text = "[OK]"
+
+        per_camera.append(
+            {
+                "name": cam_name,
+                "confirmed": s.get("confirmed", 0),
+                "detected_only": s.get("subthreshold", 0),
+                "missed": cam_miss,
+                "miss_rate": cam_miss_rate,
+                "verdict": verdict,
+                "verdict_text": verdict_text,
+            }
+        )
+
+    uncertain_total = raw_stats["tier_counts"]["uncertain_35to45"]
+    weak_total = raw_stats["tier_counts"]["weak_25to35"]
+    subthreshold_total = uncertain_total + weak_total
+    uw_dropout = raw_stats["dropout_counts"]["uncertain"] + raw_stats["dropout_counts"]["weak"]
+    dropout_rate = _pct(uw_dropout, subthreshold_total) / 100.0
+
+    if dropout_rate > 0.60:
+        dropout_explanation = (
+            "Most sub-threshold frames are harmless dropouts inside confirmed events"
+        )
+    else:
+        dropout_explanation = (
+            "Many sub-threshold frames are NOT inside confirmed events — review detected-only events"
+        )
+
+    ss = raw_stats["subthreshold_sequences"]
+    if raw_stats["subthreshold_peak_confs"]:
+        avg_peak = sum(raw_stats["subthreshold_peak_confs"]) / len(raw_stats["subthreshold_peak_confs"])
+    else:
+        avg_peak = 0.0
+
+    if any_warned:
+        recommendation = (
+            "One or more cameras have a high miss rate. Review motion gate or confidence threshold."
+        )
+    elif avg_peak > 0.35 and ss > 0:
+        recommendation = (
+            f"{ss} events detected but not alerted (avg peak {avg_peak:.2f}). "
+            "Consider testing threshold 0.35."
+        )
+    else:
+        recommendation = "System operating normally"
+
+    return {
+        "per_camera": per_camera,
+        "global_stats": {
+            "dropout_rate": dropout_rate,
+            "dropout_explanation": dropout_explanation,
+            "detected_not_alerted": ss,
+            "avg_peak_confidence": avg_peak,
+            "recommendation": recommendation,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+def _ensure_config_hashed(config_path, dashboard_config):
+    """Hash plaintext passwords and generate secret_key if missing."""
+    changed = False
+    for key in ("viewer_password", "admin_password"):
+        pw = dashboard_config.get(key)
+        if isinstance(pw, str) and pw and not pw.startswith("$2b$"):
+            dashboard_config[key] = bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
+            changed = True
+    if not dashboard_config.get("secret_key"):
+        import secrets
+
+        dashboard_config["secret_key"] = secrets.token_hex(32)
+        changed = True
+    if changed and os.path.isfile(config_path):
+        try:
+            with open(config_path, "r") as f:
+                full_config = yaml.safe_load(f)
+            if "dashboard" not in full_config:
+                full_config["dashboard"] = {}
+            for k, v in dashboard_config.items():
+                full_config["dashboard"][k] = v
+            with open(config_path, "w") as f:
+                yaml.dump(full_config, f, default_flow_style=False, sort_keys=False)
+        except Exception:
+            pass
+
+
+def _save_dashboard_config(config_path, dashboard_config):
+    """Persist the dashboard section back to config.yaml."""
+    if not os.path.isfile(config_path):
+        return
+    try:
+        with open(config_path, "r") as f:
+            full_config = yaml.safe_load(f)
+        if not isinstance(full_config, dict):
+            full_config = {}
+        full_config["dashboard"] = dashboard_config
+        with open(config_path, "w") as f:
+            yaml.dump(full_config, f, default_flow_style=False, sort_keys=False)
+    except Exception:
+        pass
+
+
+
+_app_start_time = datetime.now()
+
+
+def create_app(shared_state, dashboard_config):
+    """Create Flask app instance."""
+    global _app_start_time
+    _app_start_time = datetime.now()
+
+    _ensure_config_hashed(_CONFIG_PATH, dashboard_config)
+
+    app = Flask(
+        __name__,
+        template_folder=os.path.join(_PROJECT_ROOT, "templates"),
+        static_folder=os.path.join(_PROJECT_ROOT, "static"),
+    )
+    app.secret_key = dashboard_config["secret_key"]
+    app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=7)
+
+    snapshots_dir = os.path.join(
+        _PROJECT_ROOT, dashboard_config.get("snapshots_dir", "snapshots")
+    )
+    thumb_cache_dir = os.path.join(snapshots_dir, ".thumbs")
+    os.makedirs(thumb_cache_dir, exist_ok=True)
+
+    # Stats cache -----------------------------------------------------------
+    _stats_cache = {"result": None, "computed_at": None, "lock": threading.Lock()}
+    _stats_computing = {"active": False, "lock": threading.Lock()}
+    _STATS_CACHE_TTL = 300
+
+    @app.context_processor
+    def inject_globals():
+        return {
+            "public_access": dashboard_config.get("public_access", True),
+        }
+
+    # Auth decorators -------------------------------------------------------
+    def require_viewer(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            public = dashboard_config.get("public_access", True)
+            if public and request.endpoint in ("home", "alerts", "snapshot_thumb", "snapshot_full"):
+                return f(*args, **kwargs)
+            if session.get("role") in ("viewer", "admin"):
+                return f(*args, **kwargs)
+            return redirect(url_for("login", next=request.path))
+
+        return decorated
+
+    def require_admin(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            if session.get("role") == "admin":
+                return f(*args, **kwargs)
+            return redirect(url_for("login", next=request.path))
+
+        return decorated
+
+    # Helpers ---------------------------------------------------------------
+    def _rel_time(dt):
+        if dt is None:
+            return "never"
+        delta = datetime.now() - dt
+        secs = delta.total_seconds()
+        if secs < 60:
+            return "just now"
+        if secs < 3600:
+            return f"{int(secs / 60)} min ago"
+        if secs < 86400:
+            return f"{int(secs / 3600)}h ago"
+        return dt.strftime("%d %b %H:%M")
+
+    def _safe_filename(tier, filename):
+        if ".." in tier or ".." in filename:
+            return False
+        if filename.startswith("."):
+            return False
+        if "/" in tier or "\\" in tier or "/" in filename or "\\" in filename:
+            return False
+        return True
+
+    def _check_password(password, hash_str):
+        if not hash_str:
+            return False
+        try:
+            return bcrypt.checkpw(password.encode(), hash_str.encode())
+        except Exception:
+            return False
+
+    # Routes ----------------------------------------------------------------
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        if session.get("role"):
+            return redirect(request.args.get("next") or url_for("home"))
+        if request.method == "POST":
+            password = request.form.get("password", "")
+            viewer_hash = dashboard_config.get("viewer_password", "") or ""
+            admin_hash = dashboard_config.get("admin_password", "") or ""
+
+            # First-login setup: if a hash is empty, accept any password and store it
+            if not admin_hash and password:
+                new_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+                dashboard_config["admin_password"] = new_hash
+                _save_dashboard_config(_CONFIG_PATH, dashboard_config)
+                session.permanent = True
+                session["role"] = "admin"
+                return redirect(request.args.get("next") or url_for("home"))
+
+            if not viewer_hash and password:
+                new_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+                dashboard_config["viewer_password"] = new_hash
+                _save_dashboard_config(_CONFIG_PATH, dashboard_config)
+                session.permanent = True
+                session["role"] = "viewer"
+                return redirect(request.args.get("next") or url_for("home"))
+
+            if _check_password(password, viewer_hash):
+                session.permanent = True
+                session["role"] = "viewer"
+                return redirect(request.args.get("next") or url_for("home"))
+            if _check_password(password, admin_hash):
+                session.permanent = True
+                session["role"] = "admin"
+                return redirect(request.args.get("next") or url_for("home"))
+
+            time.sleep(1)
+            flash("Incorrect password.")
+
+        return render_template("login.html")
+
+    @app.route("/logout")
+    def logout():
+        session.clear()
+        if dashboard_config.get("public_access", True):
+            return redirect(url_for("home"))
+        return redirect(url_for("login"))
+
+    @app.route("/")
+    @require_viewer
+    def home():
+        now = datetime.now()
+
+        # Load camera configs
+        try:
+            with open(_CONFIG_PATH, "r") as f:
+                full_config = yaml.safe_load(f)
+            cam_configs = full_config.get("cameras", [])
+        except Exception:
+            cam_configs = []
+
+        # Read shared state
+        stream_status = shared_state.get_stream_status()
+        yolo_last = shared_state.get_yolo_last_inference()
+
+        # Build camera list with LIVE/OFFLINE status
+        cameras = []
+        all_live = True
+        error_reasons = []
+
+        for cam in cam_configs:
+            name = cam.get("name", f"Camera {cam.get('id', '?')}")
+            last_ts = stream_status.get(name)
+            if last_ts is None:
+                live = False
+                age_sec = None
+            else:
+                age_sec = (now - last_ts).total_seconds()
+                live = age_sec <= 10
+            if not live:
+                all_live = False
+                if age_sec is not None:
+                    error_reasons.append(f"{name} stream offline · last frame {int(age_sec)}s ago")
+                else:
+                    error_reasons.append(f"{name} stream offline · no frames yet")
+            cameras.append({"name": name, "live": live})
+
+        # Inference thread status
+        inference_stalled = False
+        if yolo_last is None:
+            inference_stalled = True
+        else:
+            yolo_age = (now - yolo_last).total_seconds()
+            if yolo_age > 30:
+                inference_stalled = True
+
+        if inference_stalled:
+            all_live = False
+            if yolo_last is None:
+                error_reasons.append("Inference stalled · never started")
+            else:
+                yolo_age = int((now - yolo_last).total_seconds())
+                error_reasons.append(f"Inference stalled · last inference {yolo_age}s ago")
+
+        system_status = "RUNNING" if all_live else "ERROR"
+        system_reason = " · ".join(error_reasons) if error_reasons else None
+
+        # Last alert
+        last_alert = None
+        detections = shared_state.get_recent_detections(limit=1)
+        if detections:
+            d = detections[-1]
+            thumb_url, full_url = _resolve_snapshot_urls(d.snapshot_path)
+            last_alert = {
+                "camera_name": d.camera_name,
+                "confidence": d.confidence,
+                "rel_time": _rel_time(d.timestamp),
+                "thumb_url": thumb_url,
+                "full_url": full_url,
+            }
+
+        response = make_response(
+            render_template(
+                "home.html",
+                system_status=system_status,
+                system_reason=system_reason,
+                cameras=cameras,
+                last_alert=last_alert,
+            )
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.route("/alerts")
+    @require_viewer
+    def alerts():
+        recent_count = dashboard_config.get("recent_alerts_count", 10)
+        files = _get_folder_files(snapshots_dir, "confirmed_45plus")[:recent_count]
+
+        alert_list = []
+        for f in files:
+            rec = _parse_snapshot_filename(f, "confirmed_45plus")
+            if rec is None:
+                continue
+            alert_list.append(
+                {
+                    "filename": f,
+                    "camera_name": rec["camera_name"],
+                    "timestamp_str": rec["timestamp"].strftime("%a %d %b, %H:%M:%S"),
+                    "confidence": rec["confidence"],
+                }
+            )
+
+        response = make_response(render_template("alerts.html", alerts=alert_list))
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.route("/snapshots")
+    @require_admin
+    def snapshots():
+        tiers = ["confirmed_45plus", "uncertain_35to45", "weak_25to35", "motion_no_detection"]
+        tier = request.args.get("tier", "confirmed_45plus")
+        if tier not in tiers:
+            tier = "confirmed_45plus"
+        camera = request.args.get("camera", "")
+        date = request.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+        page = int(request.args.get("page", 1))
+        if page < 1:
+            page = 1
+
+        files = _get_folder_files(snapshots_dir, tier)
+        parsed = [_parse_snapshot_filename(f, tier) for f in files]
+        parsed = [p for p in parsed if p]
+
+        if camera:
+            parsed = [p for p in parsed if p["camera_name"] == camera]
+        if date:
+            date_str = date.replace("-", "")
+            parsed = [p for p in parsed if date_str in p["filename"]]
+
+        per_page = 24
+        total = len(parsed)
+        start = (page - 1) * per_page
+        end = start + per_page
+        page_items = parsed[start:end]
+        has_next = total > end
+
+        all_cameras = set()
+        for t in tiers:
+            for f in _get_folder_files(snapshots_dir, t):
+                rec = _parse_snapshot_filename(f, t)
+                if rec:
+                    all_cameras.add(rec["camera_name"])
+
+        snap_list = []
+        for p in page_items:
+            snap_list.append(
+                {
+                    "filename": p["filename"],
+                    "time_str": p["timestamp"].strftime("%H:%M:%S"),
+                    "confidence": p["confidence"],
+                }
+            )
+
+        response = make_response(
+            render_template(
+                "snapshots.html",
+                tiers=tiers,
+                tier=tier,
+                camera=camera,
+                date=date,
+                page=page,
+                has_next=has_next,
+                cameras=sorted(all_cameras),
+                snapshots=snap_list,
+            )
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.route("/stats")
+    @require_admin
+    def stats():
+        now = datetime.now()
+
+        # System health data
+        stream_status = shared_state.get_stream_status()
+        yolo_last = shared_state.get_yolo_last_inference()
+        pipeline_start = shared_state.get_pipeline_start_time()
+
+        # Uptime
+        uptime = _fmt_uptime(pipeline_start) if pipeline_start else "unknown"
+
+        # Inference thread
+        if yolo_last:
+            yolo_age = (now - yolo_last).total_seconds()
+            if yolo_age > 30:
+                inference_status = "STALLED"
+            else:
+                inference_status = "RUNNING"
+            inference_age = _fmt_age(yolo_last)
+        else:
+            inference_status = "STALLED"
+            inference_age = "never"
+
+        # Queue depths (placeholders - no queues currently wired)
+        inf_queue = getattr(shared_state, "inference_queue", None)
+        inf_queue_depth = inf_queue.qsize() if inf_queue else 0
+        notif_queue = getattr(shared_state, "notifier_queue", None)
+        notif_queue_depth = notif_queue.qsize() if notif_queue else 0
+
+        # Camera streams health
+        try:
+            with open(_CONFIG_PATH, "r") as f:
+                full_config = yaml.safe_load(f)
+            cam_configs = full_config.get("cameras", [])
+        except Exception:
+            cam_configs = []
+
+        cameras_health = []
+        for cam in cam_configs:
+            name = cam.get("name", f"Camera {cam.get('id', '?')}")
+            last_ts = stream_status.get(name)
+            if last_ts:
+                age = (now - last_ts).total_seconds()
+                live = age <= 10
+                age_str = f"last frame {int(age)}s ago" if age >= 1 else "last frame just now"
+            else:
+                live = False
+                age_str = "no frames yet"
+            cameras_health.append({
+                "name": name,
+                "live": live,
+                "age_str": age_str,
+            })
+
+        return render_template(
+            "stats.html",
+            uptime=uptime,
+            inference_status=inference_status,
+            inference_age=inference_age,
+            inference_queue=inf_queue_depth,
+            notifier_queue=notif_queue_depth,
+            cameras=cameras_health,
+        )
+
+    @app.route("/stats/results")
+    @require_admin
+    def stats_results():
+        force = request.args.get("force") == "true"
+        gap_threshold = float(request.args.get("gap_threshold", 3.0))
+
+        with _stats_cache["lock"]:
+            cached = _stats_cache["result"]
+            cached_at = _stats_cache["computed_at"]
+            is_fresh = (
+                cached is not None
+                and cached_at is not None
+                and (datetime.now() - cached_at).total_seconds() < _STATS_CACHE_TTL
+            )
+
+        if not force and is_fresh:
+            age = str(datetime.now() - cached_at).split(".")[0]
+            html = render_template("stats_results.html", stats=cached)
+            return jsonify({"status": "done", "html": html, "age": age})
+
+        with _stats_computing["lock"]:
+            if _stats_computing["active"]:
+                return jsonify({"status": "computing"})
+            _stats_computing["active"] = True
+
+        if force:
+            with _stats_cache["lock"]:
+                _stats_cache["result"] = None
+                _stats_cache["computed_at"] = None
+
+        def compute():
+            try:
+                records = _walk_all_snapshots(snapshots_dir)
+                if len(records) < 10:
+                    result = {
+                        "per_camera": [],
+                        "global_stats": {
+                            "dropout_rate": 0.0,
+                            "dropout_explanation": "Not enough data for meaningful analysis (<10 frames)",
+                            "detected_not_alerted": 0,
+                            "avg_peak_confidence": 0.0,
+                            "recommendation": "Not enough data for analysis",
+                        },
+                    }
+                else:
+                    sequences = _cluster_sequences(records, gap_threshold)
+                    enriched = _classify_sequences(sequences)
+                    raw = _compute_stats(enriched)
+                    result = _format_stats_for_template(raw, gap_threshold)
+                with _stats_cache["lock"]:
+                    _stats_cache["result"] = result
+                    _stats_cache["computed_at"] = datetime.now()
+            except Exception as e:
+                with _stats_cache["lock"]:
+                    _stats_cache["result"] = {
+                        "per_camera": [],
+                        "global_stats": {
+                            "dropout_rate": 0.0,
+                            "dropout_explanation": f"Error during computation: {e}",
+                            "detected_not_alerted": 0,
+                            "avg_peak_confidence": 0.0,
+                            "recommendation": "Stats computation failed",
+                        },
+                    }
+                    _stats_cache["computed_at"] = datetime.now()
+            finally:
+                with _stats_computing["lock"]:
+                    _stats_computing["active"] = False
+
+        t = threading.Thread(target=compute, name="StatsCompute", daemon=True)
+        t.start()
+        return jsonify({"status": "computing"})
+
+    @app.route("/settings")
+    @require_admin
+    def settings():
+        try:
+            with open(_CONFIG_PATH, "r") as f:
+                full_config = yaml.safe_load(f)
+        except Exception:
+            full_config = {}
+
+        def mask(value):
+            if isinstance(value, dict):
+                new = {}
+                for k, v in value.items():
+                    if k in ("token", "chat_id", "admin_password", "viewer_password"):
+                        new[k] = "••••••••"
+                    elif k == "rtsp" and isinstance(v, str) and len(v) > 8:
+                        new[k] = "••••••" + v[-8:]
+                    else:
+                        new[k] = mask(v)
+                return new
+            elif isinstance(value, list):
+                return [mask(item) for item in value]
+            return value
+
+        masked = mask(full_config)
+        response = make_response(render_template("settings.html", config=masked))
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.route("/snapshot/thumb/<tier>/<filename>")
+    @require_viewer
+    def snapshot_thumb(tier, filename):
+        if not _safe_filename(tier, filename):
+            return "Not found", 404
+        src_path = os.path.join(snapshots_dir, tier, filename)
+        thumb_dir = os.path.join(thumb_cache_dir, tier)
+        os.makedirs(thumb_dir, exist_ok=True)
+        thumb_path = os.path.join(thumb_dir, filename)
+
+        if not os.path.exists(thumb_path):
+            if not os.path.exists(src_path):
+                return "Not found", 404
+            img = cv2.imread(src_path)
+            if img is None:
+                return "Invalid image", 400
+            thumb = cv2.resize(img, (240, 135))
+            cv2.imwrite(thumb_path, thumb)
+
+        response = send_file(thumb_path, mimetype="image/jpeg")
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
+
+    @app.route("/snapshot/full/<tier>/<filename>")
+    @require_viewer
+    def snapshot_full(tier, filename):
+        if not _safe_filename(tier, filename):
+            return "Not found", 404
+        path = os.path.join(snapshots_dir, tier, filename)
+        if not os.path.exists(path):
+            return "Not found", 404
+        response = send_file(path, mimetype="image/jpeg")
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
+
+    return app
+
+
+# ---------------------------------------------------------------------------
+# Standalone entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    with open(_CONFIG_PATH, "r") as f:
+        config = yaml.safe_load(f)
+    dashboard_config = config.get("dashboard", {})
+
+    from state import SharedState
+
+    state = SharedState()
+    app = create_app(state, dashboard_config)
+    port = dashboard_config.get("port", 8080)
+    debug = "--debug" in sys.argv
+    app.run(host="0.0.0.0", port=port, debug=debug)

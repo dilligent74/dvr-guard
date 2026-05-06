@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+
+{% block title %}Status – DVR Guard{% endblock %}
+
+{% block content %}
+<div class="system-header">
+  <div class="system-pill {% if system_status == 'RUNNING' %}status-running{% else %}status-error{% endif %}">
+    SYSTEM: {{ system_status }}
+  </div>
+  {% if system_reason %}
+  <div class="system-reason">{{ system_reason }}</div>
+  {% endif %}
+</div>
+
+<h2 class="section-heading">Camera streams</h2>
+<div class="stream-table">
+  {% for cam in cameras %}
+  <div class="stream-row">
+    <span class="stream-name">{{ cam.name }}</span>
+    <span class="status-pill {% if cam.live %}status-live{% else %}status-offline{% endif %}">
+      {% if cam.live %}LIVE{% else %}OFFLINE{% endif %}
+    </span>
+  </div>
+  {% else %}
+  <div class="empty-state">No cameras configured.</div>
+  {% endfor %}
+</div>
+
+{% if last_alert %}
+<h2 class="section-heading">Last alert</h2>
+<div class="last-alert-card">
+  {% if last_alert.thumb_url %}
+  <img class="last-alert-thumb"
+       src="{{ last_alert.thumb_url }}"
+       alt="Last alert snapshot"
+       loading="lazy"
+       onclick="openLightbox('{{ last_alert.full_url }}')">
+  {% endif %}
+  <div class="last-alert-meta">
+    {{ last_alert.camera_name }} · {{ last_alert.rel_time }} · {{ "%0.2f"|format(last_alert.confidence) }}
+  </div>
+</div>
+{% else %}
+<div class="last-alert-empty">No detections recorded yet.</div>
+{% endif %}
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function(){
+  'use strict';
+  let timer;
+  function refresh(){ window.location.reload(); }
+  function startTimer(){ timer = setInterval(refresh, 15000); }
+  function stopTimer(){ clearInterval(timer); timer = null; }
+  document.addEventListener('visibilitychange', function(){
+    if(document.visibilityState === 'visible'){ startTimer(); }
+    else { stopTimer(); }
+  });
+  startTimer();
+})();
+</script>
+{% endblock %}

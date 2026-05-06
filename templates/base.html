@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}DVR Guard{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body>
+
+<header class="site-header">
+  <h1>DVR Guard</h1>
+  {% if session.role == 'admin' %}<span class="admin-badge">Admin</span>{% endif %}
+</header>
+
+<nav class="bottom-nav" aria-label="Primary">
+  {% set unauthenticated = not session.role %}
+  {% set public = public_access|default(true) %}
+
+  <a class="nav-item {% if request.endpoint == 'home' %}active{% endif %}" href="{{ url_for('home') }}">
+    <span>Home</span>
+  </a>
+  <a class="nav-item {% if request.endpoint == 'alerts' %}active{% endif %}" href="{{ url_for('alerts') }}">
+    <span>Alerts</span>
+  </a>
+
+  {% if session.role == 'admin' %}
+    <!-- desktop: show all admin links -->
+    <a class="nav-item hide-mobile {% if request.endpoint == 'snapshots' %}active{% endif %}" href="{{ url_for('snapshots') }}">
+      <span>Snapshots</span>
+    </a>
+    <a class="nav-item hide-mobile {% if request.endpoint == 'stats' %}active{% endif %}" href="{{ url_for('stats') }}">
+      <span>Stats</span>
+    </a>
+    <a class="nav-item hide-mobile {% if request.endpoint == 'settings' %}active{% endif %}" href="{{ url_for('settings') }}">
+      <span>Settings</span>
+    </a>
+    <!-- mobile: single Admin entry point -->
+    <a class="nav-item hide-desktop {% if request.endpoint in ('snapshots', 'stats', 'settings') %}active{% endif %}" href="{{ url_for('snapshots') }}">
+      <span>Admin</span>
+    </a>
+  {% elif unauthenticated and public %}
+    <a class="nav-item" href="{{ url_for('login') }}"><span>Admin</span></a>
+  {% endif %}
+
+  {% if session.role %}
+    <a class="nav-item" href="{{ url_for('logout') }}"><span>Logout</span></a>
+  {% endif %}
+</nav>
+
+<main class="container">
+  {% block content %}{% endblock %}
+</main>
+
+<!-- Lightbox -->
+<div id="lightbox" class="lightbox" onclick="closeLightbox()">
+  <img id="lightbox-img" src="" alt="Snapshot" loading="eager" onclick="event.stopPropagation()">
+</div>
+
+<script>
+function openLightbox(src) {
+  const lb = document.getElementById('lightbox');
+  document.getElementById('lightbox-img').src = src;
+  lb.classList.add('visible');
+}
+function closeLightbox() {
+  document.getElementById('lightbox').classList.remove('visible');
+}
+</script>
+
+{% block extra_js %}{% endblock %}
+</body>
+</html>
