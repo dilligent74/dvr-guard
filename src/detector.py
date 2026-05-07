@@ -6,6 +6,7 @@ YOLO26n ONNX wrapper -- exported WITH nms=True, output shape (1, 300, 6).
 import cv2
 import numpy as np
 import logging
+import threading
 import argparse
 from pathlib import Path
 from typing import Optional
@@ -42,6 +43,7 @@ class PersonDetector:
         self._shared_state = shared_state
         self._session = None
         self._first_inference = True
+        self._inference_lock = threading.Lock()
         self._load_model()
 
     def _load_model(self):
@@ -169,11 +171,11 @@ class PersonDetector:
         blob, scale, pad_offset = self._preprocess(frame)
         orig_shape = frame.shape[:2]
 
-        outputs = self._session.run(self._output_names, {self._input_name: blob})
+        with self._inference_lock:
+            outputs = self._session.run(self._output_names, {self._input_name: blob})
 
         if self._first_inference:
             shape = outputs[0].shape
-            print(f"DEBUG: outputs[0].shape = {shape}")
             logger.info(f"First inference output shape: {shape}")
             if len(shape) != 3 or shape[2] != 6:
                 logger.warning(

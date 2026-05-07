@@ -22,9 +22,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
-def load_config(config_path: str = "config.yaml") -> dict:
+
+def load_config(config_path: str = None) -> dict:
     """Load configuration from YAML file."""
+    if config_path is None:
+        config_path = _PROJECT_ROOT / "config.yaml"
     config_path = Path(config_path)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -54,7 +58,7 @@ def main():
     # Initialize person detector
     detection_config = config.get("detection", {})
     detector = PersonDetector(
-        model_path=detection_config.get("model_path", "models/yolo26n.onnx"),
+        model_path=detection_config.get("model_path", str(_PROJECT_ROOT / "models/yolo26n.onnx")),
         confidence_threshold=detection_config.get("confidence_threshold", 0.45),
         nms_iou_threshold=detection_config.get("nms_iou_threshold", 0.45),
         person_class_id=detection_config.get("person_class_id", 0),
@@ -92,7 +96,7 @@ def main():
     # Global settings
     global_motion = config.get("motion", {})
     cooldown_seconds = config.get("cooldown_seconds", 60)
-    snapshot_dir = config.get("snapshot_dir", "snapshots")
+    snapshot_dir = config.get("snapshot_dir", str(_PROJECT_ROOT / "snapshots"))
     max_snapshots_per_folder = config.get("max_snapshots_per_folder", 500)
     debug_config = config.get("debug", {})
     tiered_snapshots = debug_config.get("tiered_snapshots", False)

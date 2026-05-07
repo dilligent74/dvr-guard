@@ -5,6 +5,7 @@ Snapshot parsing, folder utils, and thumbnail serving helpers.
 
 import os
 import time
+import threading
 from datetime import datetime
 from collections import defaultdict
 
@@ -12,6 +13,7 @@ from collections import defaultdict
 # Folder listing cache
 # ---------------------------------------------------------------------------
 _folder_cache = {}
+_folder_cache_lock = threading.Lock()
 _FOLDER_CACHE_TTL = 30.0
 
 
@@ -19,16 +21,20 @@ def _get_folder_files(snapshots_dir, tier):
     """Return cached, sorted file list for a tier."""
     now = time.monotonic()
     key = (snapshots_dir, tier)
-    if key in _folder_cache:
-        ts, files = _folder_cache[key]
-        if now - ts < _FOLDER_CACHE_TTL:
-            return files
+    with _folder_cache_lock:
+        entry = _folder_cache.get(key)
+        if entry is not None:
+            ts, files = entry
+            if now - ts < _FOLDER_CACHE_TTL:
+                return files
+    # Cache miss — do the filesystem scan outside the lock
     tier_dir = os.path.join(snapshots_dir, tier)
     if not os.path.isdir(tier_dir):
         files = []
     else:
         files = sorted(os.listdir(tier_dir), reverse=True)
-    _folder_cache[key] = (now, files)
+    with _folder_cache_lock:
+        _folder_cache[key] = (now, files)
     return files
 
 

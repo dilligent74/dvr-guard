@@ -405,7 +405,7 @@ label {
 /* ===== Lightbox ===== */
 .lightbox {
   display: none;
-  position: absolute;
+  position: fixed;
   top: 0; left: 0; right: 0; bottom: 0;
   background: rgba(0,0,0,0.92);
   z-index: 100;
@@ -596,3 +596,23 @@ label {
   font-size: 0.875rem;
   margin-left: 12px;
 }
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:          #0f1117;
+    --card-bg:     #1a1d27;
+    --border:      #2a2d3a;
+    --text:        #e8eaf0;
+    --text-muted:  #8b8fa8;
+    --primary:     #4a9eff;
+    --primary-text:#fff;
+    --success:     #4caf7d;
+    --warning:     #f0a030;
+    --danger:      #ff5c5c;
+    --idle:        #6b7280;
+    --nav-bg:      #1a1d27;
+    --nav-border:  #2a2d3a;
+    --shadow:      0 1px 3px rgba(0,0,0,0.4);
+  }
+}
+

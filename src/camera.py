@@ -13,7 +13,7 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional
 
-from state import SharedState, CameraStatus
+from state import SharedState, CameraStatus, Detection
 
 logger = logging.getLogger(__name__)
 
@@ -234,14 +234,38 @@ class CameraThread(threading.Thread):
         elapsed = (datetime.now() - self._last_detection_time).total_seconds()
         return elapsed >= self.cooldown_seconds
 
+    def _connect_with_retry(self) -> bool:
+        """
+        Attempt to connect with exponential backoff.
+        Returns True when connected, False only if stop_event is set.
+        Delays: 2s, 4s, 8s, 16s, 32s, 60s, 60s, ...
+        """
+        delay = 2
+        attempt = 0
+        while not self.stop_event.is_set():
+            if attempt > 0:
+                logger.info(f"[{self.name}] Reconnect attempt {attempt}, waiting {delay}s...")
+                # Sleep in small increments so stop_event is checked promptly
+                for _ in range(delay):
+                    if self.stop_event.is_set():
+                        return False
+                    time.sleep(1)
+            if self._connect():
+                return True
+            attempt += 1
+            delay = min(delay * 2, 60)
+        return False
+
     def run(self):
         """Main thread loop."""
         logger.info(f"[{self.name}] Starting camera thread")
 
-        if not self._connect():
-            status = CameraStatus(camera_id=self.camera_id, name=self.name, online=False)
-            self.shared_state.update_camera_status(status)
-            return
+        # Initial connection with retry (handles DVR boot race, network blips at startup)
+        status = CameraStatus(camera_id=self.camera_id, name=self.name, online=False)
+        self.shared_state.update_camera_status(status)
+
+        if not self._connect_with_retry():
+            return  # stop_event was set before we could connect
 
         status = CameraStatus(camera_id=self.camera_id, name=self.name, online=True)
         self.shared_state.update_camera_status(status)
@@ -252,9 +276,12 @@ class CameraThread(threading.Thread):
                 if not ret:
                     logger.warning(f"[{self.name}] Frame grab failed, reconnecting...")
                     self._disconnect()
-                    time.sleep(2)
-                    if not self._connect():
-                        break
+                    status = CameraStatus(camera_id=self.camera_id, name=self.name, online=False)
+                    self.shared_state.update_camera_status(status)
+                    if not self._connect_with_retry():
+                        break  # stop_event was set
+                    status = CameraStatus(camera_id=self.camera_id, name=self.name, online=True)
+                    self.shared_state.update_camera_status(status)
                     continue
 
                 self.shared_state.touch_stream(self.name)
@@ -280,8 +307,6 @@ class CameraThread(threading.Thread):
                     # we added a <max 1 fps when no motion> feature somewhere to not fill no motion folder 
                     time.sleep(0.03)  # ~30 fps throttle when no motion
                     continue
-
-                status.last_motion_time = datetime.now()
 
                 # Rate limit YOLO inference to 2 fps (0.5s between analyses)
                 current_time = time.monotonic()
@@ -346,9 +371,16 @@ class CameraThread(threading.Thread):
                 best = max(person_detections, key=lambda d: d["confidence"])
                 self._last_detection_time = datetime.now()
 
-                # Update status
-                status.total_detections += 1
-                status.last_detection_time = self._last_detection_time
+                # Update status — always create a fresh object; never mutate after update_camera_status()
+                status = CameraStatus(
+                    camera_id=self.camera_id,
+                    name=self.name,
+                    online=True,
+                    last_frame_time=status.last_frame_time,
+                    fps=self._fps,
+                    total_detections=status.total_detections + 1,
+                    last_detection_time=self._last_detection_time,
+                )
                 self.shared_state.update_camera_status(status)
 
                 # Legacy snapshot removed - use tiered snapshot path instead
@@ -356,7 +388,6 @@ class CameraThread(threading.Thread):
                 snapshot_path = confirmed_snapshot_path if confirmed_snapshot_path else None
 
                 # Record detection
-                from state import Detection
                 detection_obj = Detection(
                     camera_id=self.camera_id,
                     camera_name=self.name,

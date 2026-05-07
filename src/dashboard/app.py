@@ -5,6 +5,7 @@ DVR Guard Dashboard — Mobile-first Flask interface.
 App factory and route definitions.
 """
 
+import logging
 import os
 import sys
 import cv2
@@ -82,7 +83,7 @@ def create_app(shared_state, dashboard_config):
     @app.context_processor
     def inject_globals():
         return {
-            "public_access": dashboard_config.get("public_access", True),
+            "public_access": dashboard_config.get("public_access", False),
         }
 
     # -----------------------------------------------------------------------
@@ -218,7 +219,10 @@ def create_app(shared_state, dashboard_config):
             tier = "confirmed_45plus"
         camera = request.args.get("camera", "")
         date = request.args.get("date", datetime.now().strftime("%Y-%m-%d"))
-        page = int(request.args.get("page", 1))
+        try:
+            page = int(request.args.get("page", 1))
+        except (ValueError, TypeError):
+            page = 1
         if page < 1:
             page = 1
 
@@ -297,12 +301,6 @@ def create_app(shared_state, dashboard_config):
             inference_status = "STALLED"
             inference_age = "never"
 
-        # Queue depths (placeholders - no queues currently wired)
-        inf_queue = getattr(shared_state, "inference_queue", None)
-        inf_queue_depth = inf_queue.qsize() if inf_queue else 0
-        notif_queue = getattr(shared_state, "notifier_queue", None)
-        notif_queue_depth = notif_queue.qsize() if notif_queue else 0
-
         # Camera streams health
         try:
             with open(_CONFIG_PATH, "r") as f:
@@ -333,8 +331,6 @@ def create_app(shared_state, dashboard_config):
             uptime=uptime,
             inference_status=inference_status,
             inference_age=inference_age,
-            inference_queue=inf_queue_depth,
-            notifier_queue=notif_queue_depth,
             cameras=cameras_health,
         )
 
@@ -342,7 +338,12 @@ def create_app(shared_state, dashboard_config):
     @require_admin
     def stats_results():
         force = request.args.get("force") == "true"
-        gap_threshold = float(request.args.get("gap_threshold", 3.0))
+        try:
+            gap_threshold = float(request.args.get("gap_threshold", 3.0))
+            if not (0.5 <= gap_threshold <= 60.0):
+                gap_threshold = 3.0
+        except (ValueError, TypeError):
+            gap_threshold = 3.0
 
         with _stats_cache["lock"]:
             cached = _stats_cache["result"]
@@ -391,15 +392,16 @@ def create_app(shared_state, dashboard_config):
                     _stats_cache["result"] = result
                     _stats_cache["computed_at"] = datetime.now()
             except Exception as e:
+                _app_logger.exception("Stats computation error")
                 with _stats_cache["lock"]:
                     _stats_cache["result"] = {
                         "per_camera": [],
                         "global_stats": {
                             "dropout_rate": 0.0,
-                            "dropout_explanation": f"Error during computation: {e}",
+                            "dropout_explanation": "Stats computation failed. Check server logs.",
                             "detected_not_alerted": 0,
                             "avg_peak_confidence": 0.0,
-                            "recommendation": "Stats computation failed",
+                            "recommendation": "Stats computation failed. Check server logs.",
                         },
                     }
                     _stats_cache["computed_at"] = datetime.now()
@@ -407,6 +409,7 @@ def create_app(shared_state, dashboard_config):
                 with _stats_computing["lock"]:
                     _stats_computing["active"] = False
 
+        _app_logger = logging.getLogger(__name__)
         t = threading.Thread(target=compute, name="StatsCompute", daemon=True)
         t.start()
         return jsonify({"status": "computing"})

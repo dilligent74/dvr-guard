@@ -15,18 +15,6 @@
       {{ inference_status }} (last inference {{ inference_age }})
     </span>
   </div>
-  <div class="health-row">
-    <span>Inference queue</span>
-    <span {% if inference_queue > 4 %}class="health-warn"{% endif %}>
-      {{ inference_queue }} / 8
-    </span>
-  </div>
-  <div class="health-row">
-    <span>Notifier queue</span>
-    <span {% if notifier_queue > 2 %}class="health-warn"{% endif %}>
-      {{ notifier_queue }} / 4
-    </span>
-  </div>
 </div>
 
 <div class="system-health-card">
@@ -99,9 +87,14 @@
         statusEl.classList.add('hidden');
         resultEl.classList.remove('hidden');
         refreshEl.classList.remove('hidden');
+        // Use innerHTML only for the server-rendered, Jinja2-escaped HTML fragment.
+        // The age string is set via textContent to avoid any injection risk.
         resultEl.innerHTML = data.html;
         if (data.age) {
-          resultEl.insertAdjacentHTML('afterbegin', '<p class="cache-age">Computed ' + data.age + ' ago</p>');
+          var ageP = document.createElement('p');
+          ageP.className = 'cache-age';
+          ageP.textContent = 'Computed ' + data.age + ' ago';
+          resultEl.insertBefore(ageP, resultEl.firstChild);
         }
       })
       .catch(() => {

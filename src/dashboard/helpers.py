@@ -74,13 +74,20 @@ def _resolve_snapshot_urls(snapshot_path):
         return None, None
 
 
+_VALID_TIERS = {"confirmed_45plus", "uncertain_35to45", "weak_25to35", "motion_no_detection"}
+
+
 def _safe_filename(tier, filename):
     """Validate tier and filename for path traversal attacks."""
-    if ".." in tier or ".." in filename:
+    if tier not in _VALID_TIERS:
+        return False
+    if not filename.endswith(".jpg"):
+        return False
+    if ".." in filename:
         return False
     if filename.startswith("."):
         return False
-    if "/" in tier or "\\" in tier or "/" in filename or "\\" in filename:
+    if "/" in filename or "\\" in filename or "\x00" in filename:
         return False
     return True
 
@@ -123,6 +130,7 @@ def _ensure_config_hashed(config_path, dashboard_config):
                 full_config["dashboard"][k] = v
             with open(config_path, "w") as f:
                 yaml.dump(full_config, f, default_flow_style=False, sort_keys=False)
+            os.chmod(config_path, 0o600)
         except Exception:
             pass
 
@@ -139,6 +147,7 @@ def _save_dashboard_config(config_path, dashboard_config):
         full_config["dashboard"] = dashboard_config
         with open(config_path, "w") as f:
             yaml.dump(full_config, f, default_flow_style=False, sort_keys=False)
+        os.chmod(config_path, 0o600)
     except Exception:
         pass
 

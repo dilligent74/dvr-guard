@@ -29,7 +29,8 @@ snapshot_dir: "snapshots"
 
 telegram:
   token: "your_telegram_bot_token"
-  chat_id: "your_chat_id"
+  chat_id: "your_admin_chat_id"
+  subscriber_password: "choose_a_strong_password"  # Required: Telegram /start gate
 
 debug:
   tiered_snapshots: true

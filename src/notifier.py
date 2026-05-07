@@ -28,6 +28,8 @@ SUBSCRIPTIONS_PATH = os.path.join(
     "subscriptions.json"
 )
 
+_subscribers_lock = threading.Lock()
+
 
 def load_subscribers():
     """Load subscribers from subscriptions.json, return empty dict if not exists."""
@@ -105,12 +107,14 @@ class TelegramNotifier:
         while not self._stop_event.is_set():
             try:
                 detection = self._queue.get(timeout=1.0)
-                self._process_alert(detection)
-                self._queue.task_done()
+                try:
+                    self._process_alert(detection)
+                except Exception as e:
+                    logger.error(f"Error processing alert: {e}")
+                finally:
+                    self._queue.task_done()
             except queue.Empty:
                 continue
-            except Exception as e:
-                logger.error(f"Error processing alert: {e}")
 
     def _process_alert(self, detection: Detection) -> None:
         """
@@ -132,7 +136,8 @@ class TelegramNotifier:
         
         # Send via Telegram if configured
         if self._token:
-            subscribers = load_subscribers()
+            with _subscribers_lock:
+                subscribers = load_subscribers()
             active_subs = [chat_id for chat_id, sub in subscribers.items() if sub.get("active", False)]
             if not active_subs:
                 logger.debug("No active subscribers to send alert to.")
@@ -157,7 +162,7 @@ class TelegramNotifier:
         """Send message (and optional photo) via Telegram Bot API to a specific chat."""
         base_url = f"https://api.telegram.org/bot{self._token}"
         
-        if photo_path:
+        if photo_path and os.path.exists(photo_path):
             # Send photo with caption
             with open(photo_path, "rb") as photo:
                 response = requests.post(
@@ -167,6 +172,8 @@ class TelegramNotifier:
                     timeout=10,
                 )
         else:
+            if photo_path and not os.path.exists(photo_path):
+                logger.warning(f"Snapshot file no longer exists, sending text-only alert: {photo_path}")
             # Send text message only
             response = requests.post(
                 f"{base_url}/sendMessage",
@@ -191,8 +198,9 @@ class TelegramNotifier:
             await update.message.reply_text("❌ Configuration error.")
             return ConversationHandler.END
         
-        subscribers = load_subscribers()
-        
+        with _subscribers_lock:
+            subscribers = load_subscribers()
+
         if chat_id in subscribers:
             # Returning user: show welcome back and control message
             await update.message.reply_text("Bine ai revenit!")
@@ -213,12 +221,13 @@ class TelegramNotifier:
             return ConversationHandler.END
         
         # Password correct: authorize user
-        subscribers = load_subscribers()
-        subscribers[chat_id] = {
-            "active": True,
-            "control_message_id": None
-        }
-        save_subscribers(subscribers)
+        with _subscribers_lock:
+            subscribers = load_subscribers()
+            subscribers[chat_id] = {
+                "active": True,
+                "control_message_id": None
+            }
+            save_subscribers(subscribers)
         
         await update.message.reply_text("✅ Access permis")
         await self._show_control_message(update, context, chat_id, subscribers)
@@ -261,37 +270,35 @@ class TelegramNotifier:
         )
         
         # Save control message ID
-        subscribers[chat_id]["control_message_id"] = sent_message.message_id
-        save_subscribers(subscribers)
+        with _subscribers_lock:
+            subscribers[chat_id]["control_message_id"] = sent_message.message_id
+            save_subscribers(subscribers)
 
     def _init_subscriptions(self):
         """Initialize subscriptions file and auto-add admin if needed."""
-        # This will create the file if it doesn't exist
-        subscribers = load_subscribers()
-        
-        # Auto-add admin from config if not already present
-        if self._chat_id and self._chat_id not in subscribers:
-            subscribers[self._chat_id] = {
-                "active": True,
-                "control_message_id": None
-            }
-            save_subscribers(subscribers)
-            logger.info(f"Auto-added admin chat_id {self._chat_id} to subscribers")
+        with _subscribers_lock:
+            subscribers = load_subscribers()
+            if self._chat_id and self._chat_id not in subscribers:
+                subscribers[self._chat_id] = {
+                    "active": True,
+                    "control_message_id": None
+                }
+                save_subscribers(subscribers)
+                logger.info(f"Auto-added admin chat_id {self._chat_id} to subscribers")
     
     async def _toggle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle toggle callback to enable/disable notifications."""
         query = update.callback_query
         await query.answer()  # Answer the query first
         chat_id = str(query.message.chat_id)
-        subscribers = load_subscribers()
-        
-        if chat_id not in subscribers:
-            logger.warning(f"Toggle request from non-subscribed user {chat_id}")
-            return
-        
-        # Flip active status
-        subscribers[chat_id]["active"] = not subscribers[chat_id]["active"]
-        save_subscribers(subscribers)
+        with _subscribers_lock:
+            subscribers = load_subscribers()
+            if chat_id not in subscribers:
+                logger.warning(f"Toggle request from non-subscribed user {chat_id}")
+                return
+            # Flip active status
+            subscribers[chat_id]["active"] = not subscribers[chat_id]["active"]
+            save_subscribers(subscribers)
         
         # Prepare new message content
         active = subscribers[chat_id]["active"]
@@ -336,8 +343,9 @@ class TelegramNotifier:
                 message_id=sent_message.message_id
             )
             # Save control message ID
-            subscribers[chat_id]["control_message_id"] = sent_message.message_id
-            save_subscribers(subscribers)
+            with _subscribers_lock:
+                subscribers[chat_id]["control_message_id"] = sent_message.message_id
+                save_subscribers(subscribers)
         except Exception as e:
             logger.error(f"Failed to send fresh control message for {chat_id}: {e}")
 
@@ -395,6 +403,15 @@ class TelegramNotifier:
     def stop(self) -> None:
         """Stop the notifier worker thread and polling thread."""
         logger.info("Stopping TelegramNotifier...")
+
+        # Drain the alert queue before signalling stop so queued detections are sent.
+        # Run join() in a daemon thread so we can cap the wait at 5 s.
+        drain_thread = threading.Thread(target=self._queue.join, daemon=True)
+        drain_thread.start()
+        drain_thread.join(timeout=5.0)
+        if drain_thread.is_alive():
+            logger.warning("Alert queue drain timed out after 5s — some alerts may not have been sent")
+
         self._stop_event.set()
         
         # Signal polling application to stop from main thread (cross-thread async call)
